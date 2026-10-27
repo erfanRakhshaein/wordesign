@@ -1,0 +1,39 @@
+[package]
+name = "wordesign"
+version = "1.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+
+# Markdown parsing for the preview.
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# Flowchart rendering for the preview: mermaid -> SVG -> pixels (own fonts, so CJK/Arabic/handwriting work in diagrams too).
+mermaid-rs-renderer = { version = "0.3.1", default-features = false, features = ["png"] }
+resvg = "0.47"
+usvg = "0.47"
+
+# System font discovery (fallback fonts for CJK / Arabic / ...).
+fontdb = "0.23"
+ttf-parser = "0.25"
+spellbook = "0.4.2"
+
+# Find & replace (regex mode).
+regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
+
+# Token counting (OpenAI BPE tables are bundled in the crate, so counting works offline).
+tiktoken-rs = "0.7"
+
+# Price table refresh at launch (background thread).
+ureq = { version = "2", default-features = false, features = ["tls"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+
+# Patched egui text engine: real bidirectional (RTL) text layout, cursor movement and selection.
+# See vendor/PATCHES.md. Remove once upstream egui supports bidi.
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }
+egui = { path = "vendor/egui" }

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=wordesign
+GenericName=Prompt editor
+Comment=Write structured AI prompts
+Exec=wordesign
+Icon=wordesign
+Terminal=false
+Categories=Utility;TextEditor;Development;
+Keywords=prompt;ai;llm;editor;
+StartupWMClass=wordesign
