@@ -105,11 +105,12 @@ pub struct PromptEditorApp {
     diagrams: diagram::Diagrams,
     settings: Settings,
     fx: extras::Extras,
-    logo: egui::TextureHandle,
     prices: Vec<pricing::Price>,
     price_rx: Option<std::sync::mpsc::Receiver<Result<Vec<pricing::Price>, String>>>,
     price_note: String,
     cost_quote: Option<pricing::Quote>,
+    /// Scroll requested by the vim keys, applied by whichever scroll area is on top.
+    scroll_pending: f32,
     last_purge: Instant,
     /// Folder awaiting the user's confirmation to be deleted for good.
     pending_delete: Option<DeleteTarget>,
@@ -259,11 +260,6 @@ impl PromptEditorApp {
             None => (pricing::snapshot(), "bundled prices".to_owned()),
         };
         let dir_for_prices = dir.clone();
-        let logo = cc.egui_ctx.load_texture(
-            "wordesign-logo",
-            egui::ColorImage::from_rgba_unmultiplied([crate::ICON_SIZE as usize; 2], crate::ICON_RGBA),
-            egui::TextureOptions::LINEAR,
-        );
 
         let mut app = Self {
             doc: Self::blank_doc(&dir, &[]),
@@ -275,11 +271,11 @@ impl PromptEditorApp {
             diagrams: diagram::Diagrams::new(font_db),
             settings,
             fx: extras::Extras::default(),
-            logo,
             prices,
             price_rx: Some(pricing::spawn_refresh(&dir_for_prices)),
             price_note,
             cost_quote: None,
+            scroll_pending: 0.0,
             last_purge: Instant::now(),
             pending_delete: None,
             toast_bad: false,
@@ -451,6 +447,9 @@ impl PromptEditorApp {
     }
 
     fn current_folder(&self) -> Option<String> {
+        if self.is_template_doc() {
+            return None;
+        }
         store::folder_of(&self.dir, &self.doc.path)
     }
 
@@ -635,6 +634,7 @@ impl eframe::App for PromptEditorApp {
         self.ctrl_enter = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
         self.extras_shortcuts(ctx);
         self.extras_escape(ctx);
+        self.vim_keys(ctx);
         // Ctrl+E exports from anywhere, including the preview.
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::E)) {
             self.export(ctx);
@@ -754,13 +754,17 @@ impl eframe::App for PromptEditorApp {
                 bottom: 10,
             }))
             .show(ui, |ui| {
-                let Self { doc, st, view, .. } = self;
+                let Self { doc, st, view, scroll_pending, show_preview, .. } = self;
+                let dy = if *show_preview { 0.0 } else { std::mem::take(scroll_pending) };
                 let pending = doc.prompt.unaddressed_variables().len();
                 let canvas = tabs_and_canvas(ui, view, pending);
                 ui.scope_builder(
                     egui::UiBuilder::new().max_rect(canvas.shrink2(Vec2::new(10.0, 12.0))),
                     |ui| {
                         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            if dy != 0.0 {
+                                ui.scroll_with_delta(Vec2::new(0.0, dy));
+                            }
                             let avail = ui.available_width();
                             let w = (avail - 24.0).clamp(280.0, MAX_COLUMN_WIDTH);
                             let pad = ((avail - w) / 2.0).max(8.0);
@@ -785,6 +789,8 @@ impl eframe::App for PromptEditorApp {
         self.pad_window(&ctx);
         self.find_bar(&ctx);
         self.commit_dialog(&ctx);
+        self.new_prompt_dialog(&ctx);
+        self.save_template_dialog(&ctx);
         self.context_chooser(&ctx);
         self.context_manager(&ctx);
         self.poll_prices(&ctx);
@@ -821,7 +827,11 @@ impl PromptEditorApp {
                 ui.menu_button("New", |ui| {
                     if ui.add(egui::Button::new("Prompt").shortcut_text("Ctrl+N")).clicked() {
                         let folder = self.current_folder();
-                        self.new_doc_in(ctx, folder);
+                        self.request_new(ctx, folder);
+                        ui.close();
+                    }
+                    if ui.button("Template prompt").clicked() {
+                        self.new_template_doc(ctx);
                         ui.close();
                     }
                     if ui.button("Reusable context…").clicked() {
@@ -899,10 +909,6 @@ impl PromptEditorApp {
                     self.open_cheatsheet();
                     ui.close();
                 }
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("wordesign").color(theme::neon_hot()));
-                ui.add(egui::Image::new(&self.logo).fit_to_exact_size(Vec2::splat(22.0)));
             });
         });
     }
@@ -1171,6 +1177,13 @@ impl PromptEditorApp {
                 {
                     self.show_preview = !self.show_preview;
                 }
+                if !self.is_template_doc()
+                    && theme::tool_button(ui, "Save as template")
+                        .on_hover_text("Keep a copy of this prompt to start new prompts from")
+                        .clicked()
+                {
+                    self.fx.tmpl_save = Some(self.doc.name.clone());
+                }
             });
         });
     }
@@ -1182,7 +1195,7 @@ impl PromptEditorApp {
             .clicked()
         {
             let folder = self.current_folder();
-            self.new_doc_in(ctx, folder);
+            self.request_new(ctx, folder);
         }
         ui.add_space(12.0);
 
@@ -1237,7 +1250,7 @@ impl PromptEditorApp {
                 None => loose.push(row),
             }
         }
-        if !self.entries.iter().any(|e| e.path == cur) {
+        if !self.entries.iter().any(|e| e.path == cur) && !self.is_template_doc() {
             let row = (self.doc.name.clone(), cur.clone());
             match cur_folder.as_deref().and_then(|f| grouped.iter_mut().find(|(n, _)| n == f)) {
                 Some((_, rows)) => rows.insert(0, row),
@@ -1252,12 +1265,32 @@ impl PromptEditorApp {
         let mut ask_delete: Option<DeleteTarget> = None;
         let mut rollback: Option<(PathBuf, String)> = None;
         let mut empty_temp = false;
+        let nav = self.fx.nav;
+        let mut nav_items: Vec<extras::NavItem> = Vec::new();
+        let mut nav_moved = std::mem::take(&mut self.fx.nav_moved);
+        // Marks the row the keyboard cursor (`s`) is on.
+        let mut mark = |ui: &mut Ui, item: extras::NavItem, top: f32, items: &mut Vec<extras::NavItem>| {
+            let idx = items.len();
+            items.push(item);
+            if nav == Some(idx) {
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(ui.max_rect().left(), top),
+                    egui::pos2(ui.max_rect().right(), ui.cursor().top() - 2.0),
+                );
+                ui.painter().rect_stroke(r, egui::CornerRadius::same(theme::RADIUS), egui::Stroke::new(1.5, theme::neon_hot()), egui::StrokeKind::Inside);
+                if std::mem::take(&mut nav_moved) {
+                    ui.scroll_to_rect(r, None);
+                }
+            }
+        };
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for (folder, rows) in &grouped {
                 let collapsed = self.collapsed.contains(folder);
                 let is_current = cur_folder.as_deref() == Some(folder.as_str());
+                let top = ui.cursor().top();
                 folder_header(ui, folder, rows.len(), collapsed, is_current, &mut toggle, &mut new_in, &mut dropped, &mut ask_delete, &mut empty_temp);
+                mark(ui, extras::NavItem::Folder(folder.clone()), top, &mut nav_items);
                 if collapsed {
                     continue;
                 }
@@ -1268,9 +1301,11 @@ impl PromptEditorApp {
                     });
                 }
                 for (name, path) in rows {
+                    let top = ui.cursor().top();
                     if prompt_row(ui, name, path, *path == cur, 28.0, Some(folder), &mut dropped, &mut ask_delete, &mut rollback, self.fx.tracked.contains(path)) {
                         open = Some(path.clone());
                     }
+                    mark(ui, extras::NavItem::Prompt(path.clone()), top, &mut nav_items);
                 }
             }
             if !grouped.is_empty() {
@@ -1278,11 +1313,14 @@ impl PromptEditorApp {
                 loose_header(ui, &mut dropped);
             }
             for (name, path) in &loose {
+                let top = ui.cursor().top();
                 if prompt_row(ui, name, path, *path == cur, 0.0, None, &mut dropped, &mut ask_delete, &mut rollback, self.fx.tracked.contains(path)) {
                     open = Some(path.clone());
                 }
+                mark(ui, extras::NavItem::Prompt(path.clone()), top, &mut nav_items);
             }
         });
+        self.fx.nav_items = nav_items;
 
         if let Some(t) = ask_delete {
             self.pending_delete = Some(t);
@@ -1299,7 +1337,7 @@ impl PromptEditorApp {
             }
         }
         if let Some(folder) = new_in {
-            self.new_doc_in(ctx, folder);
+            self.request_new(ctx, folder);
         }
         if let Some((path, folder)) = dropped {
             self.move_prompt(ctx, path, folder);
@@ -1332,13 +1370,17 @@ impl PromptEditorApp {
 
     fn status_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if let Some(err) = &self.error {
+            if self.fx.nav.is_some() {
+                ui.label(RichText::new("sidebar: j/k move · Enter opens a prompt or folds a folder · Esc leaves").small().color(theme::neon_hot()));
+            } else if let Some(err) = &self.error {
                 ui.label(RichText::new(err).small().color(theme::WARN));
             } else if let Some((msg, _)) = &self.toast {
                 let color = if self.toast_bad { theme::DANGER } else { theme::GOOD };
                 ui.label(RichText::new(msg).small().color(color));
             } else if self.doc.changed_at.is_some() {
                 ui.label(theme::muted("Saving…").small());
+            } else if self.is_template_doc() && self.doc.last_saved.is_some() {
+                ui.label(RichText::new("Saved as a template").small().color(theme::GOOD));
             } else if self.doc.last_saved.is_some() {
                 ui.label(RichText::new("Saved").small().color(theme::GOOD));
             } else {
@@ -1509,7 +1551,11 @@ impl PromptEditorApp {
                         });
                         ui.separator();
 
+                        let dy = std::mem::take(&mut self.scroll_pending);
                         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            if dy != 0.0 {
+                                ui.scroll_with_delta(Vec2::new(0.0, dy));
+                            }
                             if md.trim().is_empty() {
                                 ui.label(theme::muted("Nothing to preview yet — start writing."));
                                 return;

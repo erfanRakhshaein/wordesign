@@ -48,6 +48,18 @@ Welcome! Everything below is written for you once; delete this prompt whenever y
 - Words you defined in Definitions are cyan, click to read them.
 - Pick a model next to Calculate cost to see what sending the prompt would cost. Only the input tokens are counted. OpenAI counts are exact, other providers are estimates. Prices are refreshed at every launch.
 
+## Templates
+
+- `Save as template` (next to Preview) keeps a copy of the prompt, without its benchmarks.
+- File, New, Template prompt writes a template from scratch.
+- Starting a prompt asks `B` for blank or `T` for a template, once you have templates. In the list you can also edit or delete them.
+
+## Keyboard only
+
+- When no text box is active, `j` and `k` scroll, `d` and `u` page, `g` and `Shift+G` jump to the top or bottom.
+- `i` starts typing in the body. `Esc` leaves the text box again.
+- `s` moves into the sidebar: `j` and `k` choose, `Enter` opens a prompt or folds a folder, `Esc` leaves.
+
 ## Reusable context
 
 - Choose File, New, Reusable context to save a context you use often.

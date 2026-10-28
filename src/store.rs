@@ -251,6 +251,59 @@ pub fn delete_context(base: &Path, name: &str) -> io::Result<()> {
     std::fs::remove_file(context_path(base, name))
 }
 
+const TEMPLATE_DIR: &str = ".templates";
+
+/// Where prompt templates live (hidden from the sidebar).
+pub fn templates_dir(base: &Path) -> PathBuf {
+    base.join(TEMPLATE_DIR)
+}
+
+fn template_path(base: &Path, name: &str) -> PathBuf {
+    templates_dir(base).join(format!("{}.{EXT}", sanitize(name)))
+}
+
+pub fn is_template_path(base: &Path, path: &Path) -> bool {
+    path.parent() == Some(templates_dir(base).as_path())
+}
+
+/// Names of the saved templates, alphabetical (case-insensitive).
+pub fn list_templates(base: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(templates_dir(base))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == EXT))
+        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect();
+    v.sort_by_key(|n| n.to_lowercase());
+    v
+}
+
+pub fn read_template(base: &Path, name: &str) -> io::Result<String> {
+    std::fs::read_to_string(template_path(base, name))
+}
+
+pub fn template_file(base: &Path, name: &str) -> PathBuf {
+    template_path(base, name)
+}
+
+/// Save (or overwrite) a template; returns (stored name, whether it replaced an older one).
+pub fn write_template(base: &Path, name: &str, text: &str) -> io::Result<(String, bool)> {
+    let clean = sanitize(name);
+    if clean.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "give the template a name"));
+    }
+    std::fs::create_dir_all(templates_dir(base))?;
+    let path = template_path(base, &clean);
+    let existed = path.exists();
+    write_atomic(&path, text)?;
+    Ok((clean, existed))
+}
+
+pub fn delete_template(base: &Path, name: &str) -> io::Result<()> {
+    std::fs::remove_file(template_path(base, name))
+}
+
 /// Permanently delete one prompt file (must be a `.aiprompt` inside the library).
 pub fn delete_prompt(base: &Path, path: &Path) -> io::Result<()> {
     let inside = path.starts_with(base) && !path.components().any(|c| matches!(c, std::path::Component::ParentDir));
@@ -573,6 +626,24 @@ mod tests {
         assert!(lib.entries.is_empty() && lib.folders == vec![TEMP.to_string()], "hidden from the sidebar");
         delete_context(&base, "apple").unwrap();
         assert_eq!(list_contexts(&base), ["Pirate _ voice"]);
+    }
+
+    #[test]
+    fn templates_round_trip_and_stay_out_of_the_library() {
+        let base = tmp("templates");
+        assert!(list_templates(&base).is_empty());
+        assert!(write_template(&base, " ", "x").is_err());
+        assert_eq!(write_template(&base, "Review/bot", "A").unwrap(), ("Review_bot".to_string(), false));
+        assert_eq!(write_template(&base, "Review/bot", "B").unwrap(), ("Review_bot".to_string(), true));
+        write_template(&base, "alpha", "C").unwrap();
+        assert_eq!(list_templates(&base), ["alpha", "Review_bot"]);
+        assert_eq!(read_template(&base, "alpha").unwrap(), "C");
+        assert!(is_template_path(&base, &template_file(&base, "alpha")));
+        assert!(!is_template_path(&base, &base.join("x.aiprompt")));
+        let lib = scan(&base);
+        assert!(lib.entries.is_empty() && lib.folders == vec![TEMP.to_string()], "hidden from the sidebar");
+        delete_template(&base, "alpha").unwrap();
+        assert_eq!(list_templates(&base), ["Review_bot"]);
     }
 
     #[test]

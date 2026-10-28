@@ -131,6 +131,27 @@ pub(super) struct Extras {
     /// The "add a context" chooser is open.
     pub ctx_chooser: bool,
     pub ctx_dialog: Option<CtxDialog>,
+    /// "Blank or template?" shown when starting a prompt.
+    pub new_dialog: Option<NewDialog>,
+    /// "Save as template" name box.
+    pub tmpl_save: Option<String>,
+    /// Keyboard navigation of the sidebar (`s`): index into `nav_items`.
+    pub nav: Option<usize>,
+    pub nav_items: Vec<NavItem>,
+    pub nav_moved: bool,
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) enum NavItem {
+    Folder(String),
+    Prompt(PathBuf),
+}
+
+pub(super) struct NewDialog {
+    folder: Option<String>,
+    picking: bool,
+    sel: usize,
+    confirm_delete: Option<String>,
 }
 
 #[derive(Default)]
@@ -184,7 +205,7 @@ impl PromptEditorApp {
         let prev = ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F3));
         if new {
             let folder = self.current_folder();
-            self.new_doc_in(ctx, folder);
+            self.request_new(ctx, folder);
         }
         if find_k || replace_k {
             self.fx.find_open = true;
@@ -963,6 +984,339 @@ impl PromptEditorApp {
         }
         if !close {
             self.fx.ctx_dialog = Some(d);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// templates
+// ---------------------------------------------------------------------
+
+impl PromptEditorApp {
+    pub(super) fn is_template_doc(&self) -> bool {
+        store::is_template_path(&self.dir, &self.doc.path)
+    }
+
+    /// Start a prompt: ask blank-or-template when there are templates, otherwise just open a blank one.
+    pub(super) fn request_new(&mut self, ctx: &Context, folder: Option<String>) {
+        if store::list_templates(&self.dir).is_empty() {
+            self.new_doc_in(ctx, folder);
+        } else {
+            self.fx.new_dialog = Some(NewDialog { folder, picking: false, sel: 0, confirm_delete: None });
+        }
+    }
+
+    fn new_doc_from_template(&mut self, ctx: &Context, folder: Option<String>, template: &str) {
+        match store::read_template(&self.dir, template) {
+            Ok(text) => {
+                self.new_doc_in(ctx, folder);
+                let mut p = Prompt::from_file(&text);
+                p.benchmarks.clear();
+                self.doc.prompt = p;
+            }
+            Err(e) => self.toast_error(format!("Could not open the template: {e}")),
+        }
+    }
+
+    /// File > New > Template prompt: a blank prompt that is stored as a template.
+    pub(super) fn new_template_doc(&mut self, ctx: &Context) {
+        self.autosave(ctx, true);
+        let dir = store::templates_dir(&self.dir);
+        let _ = std::fs::create_dir_all(&dir);
+        self.doc = Self::blank_doc(&dir, &[]);
+        self.st = UiState::default();
+        self.view = View::Editor;
+        self.st.focus_request = Some(name_id());
+        self.fx.select_name = true;
+        self.toast("Template prompt: it is saved as a template, not in your library");
+    }
+
+    pub(super) fn open_template_for_edit(&mut self, ctx: &Context, name: &str) {
+        self.autosave(ctx, true);
+        let path = store::template_file(&self.dir, name);
+        self.open_path(&path);
+    }
+
+    pub(super) fn new_prompt_dialog(&mut self, ctx: &Context) {
+        let Some(mut d) = self.fx.new_dialog.take() else { return };
+        let names = store::list_templates(&self.dir);
+        let mut close = false;
+        let mut blank = false;
+        let mut use_t: Option<String> = None;
+        let mut edit_t: Option<String> = None;
+        let mut del_t: Option<String> = None;
+        let (key_b, key_t, esc, down, up, enter) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::B),
+                i.consume_key(Modifiers::NONE, Key::T),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown) | i.consume_key(Modifiers::NONE, Key::J),
+                i.consume_key(Modifiers::NONE, Key::ArrowUp) | i.consume_key(Modifiers::NONE, Key::K),
+                i.consume_key(Modifiers::NONE, Key::Enter),
+            )
+        });
+        if !d.picking {
+            if key_b {
+                blank = true;
+            }
+            if key_t {
+                d.picking = true;
+            }
+        } else {
+            let n = names.len();
+            if down && n > 0 {
+                d.sel = (d.sel + 1).min(n - 1);
+            }
+            if up {
+                d.sel = d.sel.saturating_sub(1);
+            }
+            if enter {
+                use_t = names.get(d.sel).cloned();
+            }
+        }
+        if esc {
+            if d.picking {
+                d.picking = false;
+            } else {
+                close = true;
+            }
+        }
+        egui::Window::new("New prompt")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(300.0);
+                if !d.picking {
+                    ui.label("Start from…");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "Blank  (B)").clicked() {
+                            blank = true;
+                        }
+                        if theme::tool_button(ui, "Template  (T)").clicked() {
+                            d.picking = true;
+                        }
+                    });
+                } else {
+                    ui.label(theme::muted("Choose a template  (↑↓ then Enter, Esc goes back)").small());
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let resp = ui.selectable_label(d.sel == i, n);
+                                if resp.clicked() {
+                                    use_t = Some(n.clone());
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if d.confirm_delete.as_deref() == Some(n.as_str()) {
+                                        if ui.add(egui::Button::new(RichText::new("Delete for good").color(theme::WARN))).clicked() {
+                                            del_t = Some(n.clone());
+                                        }
+                                    } else if theme::ghost_button(ui, "Delete").clicked() {
+                                        d.confirm_delete = Some(n.clone());
+                                    }
+                                    if theme::ghost_button(ui, "Edit").clicked() {
+                                        edit_t = Some(n.clone());
+                                    }
+                                });
+                            });
+                        }
+                    });
+                }
+                if theme::ghost_button(ui, "Cancel").clicked() {
+                    close = true;
+                }
+            });
+        if let Some(n) = del_t {
+            match store::delete_template(&self.dir, &n) {
+                Ok(()) => self.toast(format!("Deleted the template “{n}”")),
+                Err(e) => self.toast_error(format!("Could not delete: {e}")),
+            }
+            d.confirm_delete = None;
+            d.sel = d.sel.saturating_sub(1);
+            if store::list_templates(&self.dir).is_empty() {
+                close = true;
+            }
+        }
+        if blank {
+            self.new_doc_in(ctx, d.folder.clone());
+            close = true;
+        } else if let Some(n) = use_t {
+            self.new_doc_from_template(ctx, d.folder.clone(), &n);
+            close = true;
+        } else if let Some(n) = edit_t {
+            self.open_template_for_edit(ctx, &n);
+            close = true;
+        }
+        if !close {
+            self.fx.new_dialog = Some(d);
+        }
+    }
+
+    pub(super) fn save_template_dialog(&mut self, ctx: &Context) {
+        let Some(mut name) = self.fx.tmpl_save.take() else { return };
+        let mut save = false;
+        let mut close = false;
+        egui::Window::new("Save as template")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.label(theme::muted("Saves a copy of this prompt (without its benchmarks) to start new prompts from.").small());
+                let resp = ui.add(TextEdit::singleline(&mut name).desired_width(f32::INFINITY).hint_text("template name"));
+                if !resp.has_focus() && !ctx.data(|d| d.get_temp::<bool>(Id::new("tmpl-focused")).unwrap_or(false)) {
+                    resp.request_focus();
+                    ctx.data_mut(|d| d.insert_temp(Id::new("tmpl-focused"), true));
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    save = true;
+                }
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, "Save").clicked() {
+                        save = true;
+                    }
+                    if theme::ghost_button(ui, "Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            close = true;
+        }
+        if save {
+            let mut p = Prompt::from_file(&self.doc.prompt.to_file());
+            p.benchmarks.clear();
+            match store::write_template(&self.dir, &name, &p.to_file()) {
+                Ok((n, existed)) => {
+                    self.toast(if existed { format!("Updated the template “{n}”") } else { format!("Saved the template “{n}”") });
+                    close = true;
+                }
+                Err(e) => self.toast_error(format!("Could not save: {e}")),
+            }
+        }
+        if close {
+            ctx.data_mut(|d| d.remove::<bool>(Id::new("tmpl-focused")));
+        } else {
+            self.fx.tmpl_save = Some(name);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // vim-style keys, only while nothing is being typed into
+    // ------------------------------------------------------------------
+
+    fn any_modal(&self, ctx: &Context) -> bool {
+        self.fx.find_open
+            || self.fx.pad_open
+            || self.fx.commit.is_some()
+            || self.fx.rollback.is_some()
+            || self.fx.ctx_chooser
+            || self.fx.ctx_dialog.is_some()
+            || self.fx.new_dialog.is_some()
+            || self.fx.tmpl_save.is_some()
+            || self.pending_delete.is_some()
+            || self.new_folder.is_some()
+            || egui::Popup::is_any_open(ctx)
+    }
+
+    pub(super) fn vim_keys(&mut self, ctx: &Context) {
+        if self.any_modal(ctx) {
+            return;
+        }
+        let typing = ctx.egui_wants_keyboard_input();
+        if typing {
+            // Esc leaves the text box, which hands the keyboard back to the keys below.
+            if !self.show_preview && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                if let Some(id) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+            }
+            return;
+        }
+        let key = |ctx: &Context, k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        let shift_key = |ctx: &Context, k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, k));
+
+        // Sidebar navigation (`s`).
+        if let Some(idx) = self.fx.nav {
+            let n = self.fx.nav_items.len();
+            let mut idx = idx.min(n.saturating_sub(1));
+            let before = idx;
+            if key(ctx, Key::J) || key(ctx, Key::ArrowDown) {
+                idx = (idx + 1).min(n.saturating_sub(1));
+            }
+            if key(ctx, Key::K) || key(ctx, Key::ArrowUp) {
+                idx = idx.saturating_sub(1);
+            }
+            if shift_key(ctx, Key::G) {
+                idx = n.saturating_sub(1);
+            }
+            if key(ctx, Key::G) {
+                idx = 0;
+            }
+            self.fx.nav = Some(idx);
+            self.fx.nav_moved |= idx != before;
+            let activate = key(ctx, Key::Enter) || key(ctx, Key::L) || key(ctx, Key::Space);
+            if activate {
+                match self.fx.nav_items.get(idx).cloned() {
+                    Some(NavItem::Prompt(path)) => {
+                        self.switch_to(ctx, path);
+                        self.fx.nav = None;
+                    }
+                    Some(NavItem::Folder(f)) => {
+                        if !self.collapsed.remove(&f) {
+                            self.collapsed.insert(f);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            if key(ctx, Key::Escape) || key(ctx, Key::S) {
+                self.fx.nav = None;
+            }
+            return;
+        }
+        if key(ctx, Key::S) {
+            let cur = NavItem::Prompt(self.doc.path.clone());
+            self.fx.nav = Some(self.fx.nav_items.iter().position(|i| *i == cur).unwrap_or(0));
+            self.fx.nav_moved = true;
+            return;
+        }
+
+        // Scrolling: the preview when it is open, otherwise the editor.
+        let screen = ctx.content_rect().height();
+        let mut dy = 0.0;
+        if key(ctx, Key::J) || key(ctx, Key::ArrowDown) {
+            dy -= 70.0;
+        }
+        if key(ctx, Key::K) || key(ctx, Key::ArrowUp) {
+            dy += 70.0;
+        }
+        if key(ctx, Key::D) || key(ctx, Key::Space) {
+            dy -= screen * 0.5;
+        }
+        if key(ctx, Key::U) {
+            dy += screen * 0.5;
+        }
+        if key(ctx, Key::G) {
+            dy += 1.0e6;
+        }
+        if shift_key(ctx, Key::G) {
+            dy -= 1.0e6;
+        }
+        self.scroll_pending += dy;
+
+        // `i`: start typing in the body.
+        if !self.show_preview && key(ctx, Key::I) {
+            // The "i" itself must not be typed into the box that is about to get focus.
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "i")));
+            self.view = View::Editor;
+            let body = &self.doc.prompt.body;
+            let at = match body.get(self.doc.last_body_focus) {
+                Some(BodyBlock::Text(_)) => self.doc.last_body_focus,
+                _ => body.iter().position(|b| matches!(b, BodyBlock::Text(_))).unwrap_or(0),
+            };
+            self.st.focus_request = Some(Id::new(("body-text", at)));
         }
     }
 }

@@ -52,11 +52,18 @@ cargo run --release
 ## Install on Ubuntu
 
 ```
-unzip wordesign-v1.1.zip && cd wordesign
+unzip wordesign-v1.2.zip && cd wordesign
 ./install.sh
 ```
 
 Puts `wordesign` in `~/.local/bin`, adds an app-menu entry with the icon and needs no sudo. It uses the bundled binary (built on Ubuntu 24.04) and falls back to `cargo build --release` if that cannot run on your system. `./uninstall.sh` removes it; your prompts in `~/.wordesign` are never touched. For all users: `PREFIX=/usr/local sudo -E ./install.sh`.
+
+### New in 1.2
+
+- Logo and name removed from the window (the icon stays as the app icon).
+- **Templates**: Save as template button, File > New > Template prompt, and a blank-or-template dialog (B / T) when starting a prompt.
+- **Vim keys** when no text box is active: j/k/d/u/g/G scroll, `i` types in the body, `s` navigates the sidebar, `Esc` leaves a text box.
+- The installer updates an existing install in place and reports old and new versions; `wordesign --version` prints the version.
 
 ### New in 1.1
 
@@ -91,4 +98,3 @@ Puts `wordesign` in `~/.local/bin`, adds an app-menu entry with the icon and nee
 - Find & replace selects one match at a time; it does not highlight all matches at once.
 - Folders cannot yet be renamed from the UI (deleting works: right-click).
 - `src/fonts.rs`, `src/diagram.rs`, `src/preview.rs` — fonts, diagram rendering, preview splitting.
-# wordesign

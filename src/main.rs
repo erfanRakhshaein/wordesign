@@ -20,6 +20,10 @@ pub const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_256.rgba");
 pub const ICON_SIZE: u32 = 256;
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("wordesign {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let icon = eframe::egui::IconData { rgba: ICON_RGBA.to_vec(), width: ICON_SIZE, height: ICON_SIZE };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
